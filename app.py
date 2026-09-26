@@ -259,6 +259,7 @@ def grafico_evolucao(hist, top=5, linha_50=False):
 
 # ---------------- Sidebar ----------------
 st.sidebar.title("🗳️ Apuração TSE")
+st.sidebar.caption("por **Roberto Sousa**")
 ambiente = st.sidebar.text_input(
     "Ambiente", "oficial",
     help="'oficial' ou o nome do ambiente de teste/simulado divulgado pelo TSE")
@@ -412,3 +413,8 @@ with aba_pres:
 
 with aba_exp:
     painel(url_exp, cargos.get(cd_cargo, ""), local_exp, foto_exp, intervalo, demo, ctx="exp")
+
+
+# ---------------- Footer ----------------
+st.divider()
+st.caption("Desenvolvido por **Roberto Sousa** · Dados: TSE")
