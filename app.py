@@ -258,7 +258,7 @@ def grafico_evolucao(hist, top=5, linha_50=False):
 
 
 # ---------------- Sidebar ----------------
-st.sidebar.title("🗳️ Apuração TSE")
+st.sidebar.title("🗳️ Apuração TSE - Eleições 2026")
 st.sidebar.caption("por **Roberto Sousa**")
 ambiente = st.sidebar.text_input(
     "Ambiente", "oficial",
