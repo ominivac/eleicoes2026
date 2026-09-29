@@ -9,7 +9,10 @@ import pandas as pd
 import requests
 import streamlit as st
 
-BASE = "https://resultados.tse.jus.br"
+FONTES = {
+    "Simulado TSE 2026": ("https://resultados-sim.tse.jus.br/simulado", "simulado2026"),
+    "Oficial (dia da eleição)": ("https://resultados.tse.jus.br", "oficial"),
+}
 UFS = ["ac","al","am","ap","ba","ce","df","es","go","ma","mg","ms","mt","pa","pb",
        "pe","pi","pr","rj","rn","ro","rr","rs","sc","se","sp","to","zz"]
 NIVEL_PADRAO = {"1": "Brasil", "11": "Município", "13": "Município"}  # demais: UF
@@ -82,7 +85,6 @@ def _get(url, tentativas=3):
         limiter().esperar()
         r = http().get(url, timeout=15)
         if r.status_code in (429, 503):
-            # respeita Retry-After se vier; senão backoff exponencial: 1s, 2s, 4s
             try:
                 espera = float(r.headers.get("Retry-After", 2 ** i))
             except ValueError:
@@ -95,12 +97,12 @@ def _get(url, tentativas=3):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def get_config(url):          # arquivos de configuração mudam pouco
+def get_config(url):
     return _get(url)
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def get_resultado(url):       # resultado: cache curto e compartilhado entre usuários
+def get_resultado(url):
     return _get(url)
 
 
@@ -136,7 +138,7 @@ def simular(df, url, intervalo):
     passo = int((time.time() - inicio) // intervalo) + 1
     p = min(100.0, passo * 5.0)
 
-    rng = np.random.default_rng(len(url) * 7919)          # viés fixo por candidato
+    rng = np.random.default_rng(len(url) * 7919)
     vies = rng.normal(0, 1, len(df))
     base = (df["%"].to_numpy() * (1 + 0.25 * vies * (1 - p / 100))).clip(min=0)
     pct = base / base.sum() * 100 if base.sum() else base
@@ -160,26 +162,30 @@ def fmt_int(x) -> str:
     return f"{int(num(x)):,}".replace(",", ".")
 
 
-def montar_dir(cfg, tp, ambiente, eleicao, uf="br", pleito=""):
+def montar_dir(cfg, tp, base, ambiente, ciclo, eleicao, uf="br", pleito=""):
     """Usa os templates do atributo 'arq' da configuração de eleições (EA11)."""
+    padrao = {"ft": "<base>/<ambiente>/<ciclo>/<cd_eleicao>/fotos/<uf>",
+              "cm": "<base>/<ambiente>/<ciclo>/<cd_eleicao>/config"}
     tmpl = next((a["dir"] for a in cfg.get("arq", []) if a["tp"] == tp),
-                "<base>/<ambiente>/<ciclo>/<cd_eleicao>/dados/<uf>")
-    return (tmpl.replace("<base>", BASE).replace("<ambiente>", ambiente)
-                .replace("<ciclo>", cfg["c"]).replace("<cd_eleicao>", eleicao)
+                padrao.get(tp, "<base>/<ambiente>/<ciclo>/<cd_eleicao>/dados/<uf>"))
+    return (tmpl.replace("<base>", base).replace("<ambiente>", ambiente)
+                .replace("<ciclo>", ciclo).replace("<cd_eleicao>", eleicao)
                 .replace("<uf>", uf).replace("<cd_pleito>", pleito))
 
 
-def url_resultado(cfg, ambiente, cd_eleicao, cd_cargo, uf="br", cod_mun=None):
+def url_resultado(cfg, base, ambiente, ele, cd_cargo, uf="br", cod_mun=None):
     prefixo = f"{uf}{cod_mun}" if cod_mun else uf
-    arquivo = f"{prefixo}-c{cd_cargo.zfill(4)}-e{cd_eleicao.zfill(6)}-u.json"
-    return f'{montar_dir(cfg, "u", ambiente, cd_eleicao, uf)}/{arquivo}'
+    arquivo = f'{prefixo}-c{cd_cargo.zfill(4)}-e{ele["cd"].zfill(6)}-u.json'
+    return f'{montar_dir(cfg, "u", base, ambiente, ele["ciclo"], ele["cd"], uf)}/{arquivo}'
 
 
 def listar_eleicoes(cfg):
     out = []
     for pl in cfg.get("pl", []):
+        # 2026: ciclo fica dentro de cada pleito; formato antigo: no topo do arquivo
+        ciclo = pl.get("c") or cfg.get("c", "")
         for e in pl.get("e", []):
-            e = dict(e, pleito=pl["cd"], data=pl["dt"])
+            e = dict(e, pleito=pl["cd"], data=pl["dt"], ciclo=ciclo)
             e["label"] = f'{html.unescape(e["nm"])} — {pl["dt"]} (cód. {e["cd"]})'
             out.append(e)
     return out
@@ -198,7 +204,7 @@ def eleicao_presidente(eleicoes):
     cands = [e for e in eleicoes if "1" in cargos_da_eleicao(e)]
     if not cands:
         return None
-    return max(cands, key=lambda e: datetime.strptime(e["data"], "%d/%m/%Y"))
+    return max(cands, key=lambda e: (datetime.strptime(e["data"], "%d/%m/%Y"), int(e.get("t", 1))))
 
 
 def municipios(cfg_mun, uf):
@@ -258,19 +264,30 @@ def grafico_evolucao(hist, top=5, linha_50=False):
 
 
 # ---------------- Sidebar ----------------
-st.sidebar.title("🗳️ Apuração TSE - Eleições 2026")
+st.sidebar.title("🗳️ Apuração TSE")
 st.sidebar.caption("por **Roberto Sousa**")
-ambiente = st.sidebar.text_input(
-    "Ambiente", "oficial",
-    help="'oficial' ou o nome do ambiente de teste/simulado divulgado pelo TSE")
+
+fonte = st.sidebar.selectbox("Fonte de dados", list(FONTES))
+BASE, ambiente = FONTES[fonte]
+with st.sidebar.expander("Avançado"):
+    BASE = st.text_input("Host", BASE)
+    ambiente = st.text_input("Ambiente", ambiente)
 
 try:
     cfg = get_config(f"{BASE}/{ambiente}/comum/config/ele-c.json")
 except Exception as ex:
-    st.error(f"Não consegui ler a configuração de eleições: {ex}")
+    st.error(f"Não consegui ler a configuração de eleições ({fonte}): {ex}. "
+             f"O TSE pode não estar publicando os arquivos desta fonte agora — "
+             f"tente a outra fonte na barra lateral.")
     st.stop()
 
-st.sidebar.caption(f"Ciclo **{cfg['c']}** · config gerada em {cfg.get('dg')} {cfg.get('hg')}")
+eleicoes = listar_eleicoes(cfg)
+if not eleicoes:
+    st.warning("Nenhuma eleição na configuração.")
+    st.stop()
+
+ciclos = sorted({e["ciclo"] for e in eleicoes if e["ciclo"]})
+st.sidebar.caption(f"Ciclo **{', '.join(ciclos)}** · config gerada em {cfg.get('dg')} {cfg.get('hg')}")
 
 intervalo = st.sidebar.slider("Atualizar a cada (s)", 15, 120, 30, step=5)
 demo = st.sidebar.toggle("Modo demonstração", help="Simula a apuração avançando, para testar o gráfico")
@@ -282,11 +299,6 @@ if st.sidebar.button("Limpar histórico"):
 
 st.sidebar.divider()
 st.sidebar.subheader("🔎 Explorar")
-
-eleicoes = listar_eleicoes(cfg)
-if not eleicoes:
-    st.warning("Nenhuma eleição na configuração.")
-    st.stop()
 
 ele = st.sidebar.selectbox("Eleição", eleicoes, format_func=lambda e: e["label"])
 cargos = cargos_da_eleicao(ele)
@@ -303,7 +315,8 @@ if nivel != "Brasil":
     uf = st.sidebar.selectbox("UF", ufs_ele, format_func=str.upper)
 
 if nivel == "Município":
-    mun_url = f'{montar_dir(cfg, "cm", ambiente, ele["cd"])}/mun-e{ele["cd"].zfill(6)}-cm.json'
+    mun_dir = montar_dir(cfg, "cm", BASE, ambiente, ele["ciclo"], ele["cd"])
+    mun_url = f'{mun_dir}/mun-e{ele["cd"].zfill(6)}-cm.json'
     try:
         mapa = municipios(get_config(mun_url), uf)
     except Exception:
@@ -313,8 +326,8 @@ if nivel == "Município":
     else:
         cod_mun = st.sidebar.text_input("Código TSE do município (5 dígitos)", "").zfill(5)
 
-url_exp = url_resultado(cfg, ambiente, ele["cd"], cd_cargo, uf, cod_mun)
-foto_exp = f'{BASE}/{ambiente}/{cfg["c"]}/{ele["cd"]}/fotos/{uf}'
+url_exp = url_resultado(cfg, BASE, ambiente, ele, cd_cargo, uf, cod_mun)
+foto_exp = montar_dir(cfg, "ft", BASE, ambiente, ele["ciclo"], ele["cd"], uf)
 local_exp = {"Brasil": "Brasil", "UF": uf.upper()}.get(nivel, f"{uf.upper()} · {cod_mun}")
 st.sidebar.code(url_exp, language=None)
 
@@ -399,22 +412,19 @@ with aba_pres:
     pres = eleicao_presidente(eleicoes)
     if pres:
         painel(
-            url_resultado(cfg, ambiente, pres["cd"], "1"),
+            url_resultado(cfg, BASE, ambiente, pres, "1"),
             f"Presidente · {pres['t']}º turno", "Brasil",
-            f'{BASE}/{ambiente}/{cfg["c"]}/{pres["cd"]}/fotos/br',
+            montar_dir(cfg, "ft", BASE, ambiente, pres["ciclo"], pres["cd"], "br"),
             intervalo, demo, linha_50=True, ctx="pres",
         )
     else:
-        st.info(f"A eleição presidencial ainda não aparece na configuração do TSE "
-                f"(ciclo atual: **{cfg['c']}**). Até ser publicada, esta aba mostra "
-                f"a seleção da barra lateral para teste.")
+        st.info("A eleição presidencial ainda não aparece na configuração desta fonte. "
+                "Até ser publicada, esta aba mostra a seleção da barra lateral para teste.")
         painel(url_exp, cargos.get(cd_cargo, ""), local_exp, foto_exp,
                intervalo, demo, linha_50=True, ctx="pres")
 
 with aba_exp:
     painel(url_exp, cargos.get(cd_cargo, ""), local_exp, foto_exp, intervalo, demo, ctx="exp")
 
-
-# ---------------- Footer ----------------
 st.divider()
 st.caption("Desenvolvido por **Roberto Sousa** · Dados: TSE")
