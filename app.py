@@ -1,5 +1,6 @@
 import html
 import threading
+import uuid
 import time
 from datetime import datetime
 
@@ -149,6 +150,39 @@ def simular(df, url, intervalo):
     out = out.sort_values("Votos", ascending=False).reset_index(drop=True)
     return out, p, f"demo-{min(passo, 20)}"
 
+# ---------------- Contador de visitantes ----------------
+@st.cache_resource
+def visitas():
+    return {"lock": threading.Lock(), "total": 0, "online": {}}
+
+
+def registrar_visita():
+    v = visitas()
+    if "sid" not in st.session_state:          # nova sessão = nova visita
+        st.session_state.sid = uuid.uuid4().hex
+        with v["lock"]:
+            v["total"] += 1
+    with v["lock"]:
+        v["online"][st.session_state.sid] = time.time()   # "batimento" da sessão
+
+
+def contar_visitas(janela=60):
+    v = visitas()
+    corte = time.time() - janela
+    with v["lock"]:
+        for sid, t in list(v["online"].items()):
+            if t < corte:                      # sem sinal há 60s = saiu
+                del v["online"][sid]
+        return len(v["online"]), v["total"]
+
+
+@st.fragment(run_every="20s")
+def contador():
+    registrar_visita()
+    online, total = contar_visitas()
+    c1, c2 = st.columns(2)
+    c1.metric("👀 Online", online)
+    c2.metric("📊 Visitas", fmt_int(total))
 
 # ---------------- Helpers ----------------
 def num(x) -> float:
@@ -266,6 +300,8 @@ def grafico_evolucao(hist, top=5, linha_50=False):
 # ---------------- Sidebar ----------------
 st.sidebar.title("🗳️ Apuração TSE")
 st.sidebar.caption("por **Roberto Sousa**")
+with st.sidebar:
+    contador()
 
 fonte = st.sidebar.selectbox("Fonte de dados", list(FONTES))
 BASE, ambiente = FONTES[fonte]
@@ -427,4 +463,4 @@ with aba_exp:
     painel(url_exp, cargos.get(cd_cargo, ""), local_exp, foto_exp, intervalo, demo, ctx="exp")
 
 st.divider()
-st.caption("Desenvolvido por **Roberto Sousa** · Dados: TSE")
+st.caption("Desenvolvido por **Roberto Sousa**  - ominivac001@proton.me · Dados: TSE")
