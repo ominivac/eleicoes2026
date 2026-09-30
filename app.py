@@ -155,16 +155,31 @@ def simular(df, url, intervalo):
 def visitas():
     return {"lock": threading.Lock(), "total": 0, "online": {}}
 
+def incrementar_supabase():
+    """Soma +1 no banco e devolve o total. Retorna None se falhar."""
+    try:
+        r = http().post(
+            f'{st.secrets["SUPABASE_URL"]}/rest/v1/rpc/incrementar_visitas',
+            headers={"apikey": st.secrets["SUPABASE_KEY"],
+                     "Authorization": f'Bearer {st.secrets["SUPABASE_KEY"]}'},
+            json={}, timeout=5,
+        )
+        r.raise_for_status()
+        return int(r.json())
+    except Exception:
+        return None
+
 
 def registrar_visita():
     v = visitas()
-    if "sid" not in st.session_state:          # nova sessão = nova visita
+    if "sid" not in st.session_state:
         st.session_state.sid = uuid.uuid4().hex
+        total_banco = incrementar_supabase()
         with v["lock"]:
-            v["total"] += 1
+            # usa o total do banco; se o Supabase falhar, segue contando em memória
+            v["total"] = total_banco if total_banco is not None else v["total"] + 1
     with v["lock"]:
-        v["online"][st.session_state.sid] = time.time()   # "batimento" da sessão
-
+        v["online"][st.session_state.sid] = time.time()
 
 def contar_visitas(janela=60):
     v = visitas()
