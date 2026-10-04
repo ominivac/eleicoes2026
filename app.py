@@ -11,8 +11,8 @@ import requests
 import streamlit as st
 
 FONTES = {
+     "Oficial (dia da eleição)": ("https://resultados.tse.jus.br", "oficial"),
     "Simulado TSE 2026": ("https://resultados-sim.tse.jus.br/simulado", "simulado2026"),
-    "Oficial (dia da eleição)": ("https://resultados.tse.jus.br", "oficial"),
 }
 UFS = ["ac","al","am","ap","ba","ce","df","es","go","ma","mg","ms","mt","pa","pb",
        "pe","pi","pr","rj","rn","ro","rr","rs","sc","se","sp","to","zz"]
