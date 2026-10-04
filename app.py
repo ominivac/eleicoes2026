@@ -53,6 +53,24 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+# ---------------- Secrets ----------------
+def segredo(nome):
+    try:
+        return st.secrets[nome]
+    except Exception:
+        return None
+
+
+def ler_sb():
+    url, key = segredo("SUPABASE_URL"), segredo("SUPABASE_KEY")
+    return {"url": url, "key": key} if url and key else None
+
+
+def sb_headers(sb):
+    return {"apikey": sb["key"], "Authorization": f'Bearer {sb["key"]}',
+            "Content-Type": "application/json"}
+
+
 # ---------------- HTTP (rate limit + retry) ----------------
 class RateLimiter:
     """Token bucket simples e thread-safe (compartilhado entre todas as sessões)."""
@@ -109,28 +127,103 @@ def get_resultado(url):
     return _get(url)
 
 
-# ---------------- Histórico em memória (compartilhado) ----------------
+# ---------------- Histórico (memória + Supabase) ----------------
 @st.cache_resource
 def store():
-    return {"lock": threading.Lock(), "hist": {}, "demo_inicio": {}}
+    return {"lock": threading.Lock(), "hist": {}, "demo_inicio": {},
+            "carregado": set(), "sb": ler_sb(), "erro_sb": None}
+
+
+def sb_carregar(s, chave):
+    """Busca no Supabase os pontos já gravados (sobrevive a reinícios do app)."""
+    sb = s["sb"]
+    if not sb or chave.startswith("demo:"):
+        return []
+    try:
+        r = requests.get(
+            f'{sb["url"]}/rest/v1/historico',
+            params={"chave": f"eq.{chave}", "select": "marca,pst,hora,cands",
+                    "order": "criado_em.desc", "limit": str(MAX_PONTOS)},
+            headers=sb_headers(sb), timeout=10,
+        )
+        r.raise_for_status()
+        return list(reversed(r.json()))
+    except Exception as ex:
+        s["erro_sb"] = f"carregar: {str(ex)[:120]}"
+        return []
+
+
+def sb_salvar(s, chave, snap):
+    sb = s["sb"]
+    if not sb or chave.startswith("demo:"):
+        return
+    try:
+        r = requests.post(
+            f'{sb["url"]}/rest/v1/historico',
+            params={"on_conflict": "chave,marca"},
+            headers={**sb_headers(sb), "Prefer": "resolution=ignore-duplicates,return=minimal"},
+            json={"chave": chave, **snap}, timeout=5,
+        )
+        r.raise_for_status()
+        s["erro_sb"] = None
+    except Exception as ex:
+        s["erro_sb"] = f"salvar: {str(ex)[:120]}"
+
+
+def garantir_carregado(s, chave):
+    """Na primeira vez que uma chave aparece após o app subir, recarrega do banco."""
+    with s["lock"]:
+        if chave in s["carregado"]:
+            return
+        s["carregado"].add(chave)
+    pontos = sb_carregar(s, chave)
+    if pontos:
+        with s["lock"]:
+            h = s["hist"].setdefault(chave, [])
+            existentes = {p["marca"] for p in h}
+            h[:0] = [p for p in pontos if p["marca"] not in existentes]
+            del h[:-MAX_PONTOS]
 
 
 def registrar(chave, marca, pst, df, s=None):
     """Guarda um ponto (pst, % por candidato) só quando a totalização muda."""
+    s = s or store()
+    garantir_carregado(s, chave)
     top = df.head(TOP_HIST)
     snap = {
         "marca": marca,
-        "pst": pst,
+        "pst": float(pst),
         "hora": datetime.now(TZ).strftime("%H:%M:%S"),
-        "cands": {f'{r["Candidato"]} ({r["Partido"]})': r["%"] for _, r in top.iterrows()},
+        "cands": {f'{r["Candidato"]} ({r["Partido"]})': float(r["%"]) for _, r in top.iterrows()},
     }
-    s = s or store()
+    novo = False
     with s["lock"]:
         h = s["hist"].setdefault(chave, [])
-        if not h or h[-1]["marca"] != marca:
+        if not any(p["marca"] == marca for p in h[-5:]):
             h.append(snap)
             del h[:-MAX_PONTOS]
-        return list(h)
+            novo = True
+        out = list(h)
+    if novo:
+        sb_salvar(s, chave, snap)
+    return out
+
+
+def limpar_historico():
+    """Apaga memória e banco (só para o administrador)."""
+    s = store()
+    with s["lock"]:
+        s["carregado"].update(s["hist"].keys())   # não recarrega o que acabou de apagar
+        s["hist"].clear()
+        s["demo_inicio"].clear()
+    sb = s["sb"]
+    if sb:
+        try:
+            requests.delete(f'{sb["url"]}/rest/v1/historico',
+                            params={"chave": "neq.__nenhuma__"},
+                            headers=sb_headers(sb), timeout=10).raise_for_status()
+        except Exception as ex:
+            s["erro_sb"] = f"apagar: {str(ex)[:120]}"
 
 
 def simular(df, url, intervalo):
@@ -241,9 +334,10 @@ def candidatos(res) -> pd.DataFrame:
 # ---------------- Coletor em segundo plano ----------------
 @st.cache_resource
 def coletor(url, intervalo=20):
-    """Thread única no servidor que grava o histórico mesmo sem ninguém no app."""
+    """Thread única no servidor que grava o histórico mesmo sem ninguém no app.
+    Para sozinha quando a totalização chega ao fim."""
     s, sess, lim = store(), http(), limiter()
-    estado = {"ultimo_ok": None, "erro": None}
+    estado = {"ultimo_ok": None, "erro": None, "final": False}
 
     def loop():
         while True:
@@ -259,6 +353,9 @@ def coletor(url, intervalo=20):
                     registrar(url, f"{res.get('dt')} {res.get('ht')}", pst, df, s)
                     estado["ultimo_ok"] = datetime.now(TZ).strftime("%H:%M:%S")
                     estado["erro"] = None
+                    if res.get("tf") == "s" and pst >= 100:
+                        estado["final"] = True
+                        return
             except Exception as ex:
                 estado["erro"] = str(ex)[:120]
             time.sleep(intervalo)
@@ -275,21 +372,19 @@ def visitas():
 
 def incrementar_supabase():
     """Soma +1 no banco e devolve o total. Em caso de falha, guarda o motivo."""
+    sb = ler_sb()
+    if not sb:
+        st.session_state.erro_supabase = "secrets SUPABASE_URL/SUPABASE_KEY ausentes"
+        return None
     try:
-        r = http().post(
-            f'{st.secrets["SUPABASE_URL"]}/rest/v1/rpc/incrementar_visitas',
-            headers={"apikey": st.secrets["SUPABASE_KEY"],
-                     "Authorization": f'Bearer {st.secrets["SUPABASE_KEY"]}'},
-            json={}, timeout=5,
-        )
+        r = http().post(f'{sb["url"]}/rest/v1/rpc/incrementar_visitas',
+                        headers=sb_headers(sb), json={}, timeout=5)
         r.raise_for_status()
         total = r.json()
         if total is None:
             raise ValueError("função retornou vazio (linha id=1 não existe?)")
         st.session_state.pop("erro_supabase", None)
         return int(total)
-    except KeyError as ex:
-        st.session_state.erro_supabase = f"secret ausente: {ex}"
     except requests.HTTPError as ex:
         st.session_state.erro_supabase = f"HTTP {ex.response.status_code}: {ex.response.text[:150]}"
     except Exception as ex:
@@ -358,6 +453,8 @@ def grafico_evolucao(hist, top=5, linha_50=False):
 
 
 # ---------------- Sidebar ----------------
+admin = bool(segredo("ADMIN_KEY")) and st.query_params.get("admin") == segredo("ADMIN_KEY")
+
 st.sidebar.title("🗳️ Apuração TSE")
 st.sidebar.caption("por **Roberto Sousa**")
 with st.sidebar:
@@ -387,11 +484,15 @@ st.sidebar.caption(f"Ciclo **{', '.join(ciclos)}** · config gerada em {cfg.get(
 
 intervalo = st.sidebar.slider("Atualizar a cada (s)", 15, 120, 30, step=5)
 demo = st.sidebar.toggle("Modo demonstração", help="Simula a apuração avançando, para testar o gráfico")
-if st.sidebar.button("Limpar histórico"):
-    s = store()
-    with s["lock"]:
-        s["hist"].clear()
-        s["demo_inicio"].clear()
+
+if admin:
+    st.sidebar.success("Modo administrador")
+    if st.sidebar.button("🗑️ Limpar histórico (memória e banco)"):
+        limpar_historico()
+        st.sidebar.info("Histórico apagado.")
+    erro_sb = store()["erro_sb"]
+    st.sidebar.caption(f"Banco do histórico: {'⚠️ ' + erro_sb if erro_sb else '✅ ok'}"
+                       if store()["sb"] else "Banco do histórico: ⚠️ sem secrets do Supabase")
 
 st.sidebar.divider()
 st.sidebar.subheader("🔎 Explorar")
