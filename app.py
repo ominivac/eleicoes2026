@@ -11,6 +11,9 @@ import pandas as pd
 import requests
 import streamlit as st
 
+AUTOR = "Roberto Sousa"
+EMAIL = "ominivac001@proton.me"   # <-- coloque seu e-mail aqui
+
 TZ = ZoneInfo("America/Sao_Paulo")
 FONTES = {
     "Oficial (dia da eleição)": ("https://resultados.tse.jus.br", "oficial"),
@@ -36,7 +39,8 @@ st.markdown("""
     .block-container { padding: 1rem 0.75rem 3rem !important; }
 
     [class*="st-key-totais"] [data-testid="stHorizontalBlock"],
-    [class*="st-key-top3"] [data-testid="stHorizontalBlock"] {
+    [class*="st-key-top3"] [data-testid="stHorizontalBlock"],
+    [class*="st-key-dif"] [data-testid="stHorizontalBlock"] {
         flex-wrap: wrap !important; gap: 0.5rem !important;
     }
     [class*="st-key-totais"] [data-testid="stColumn"],
@@ -426,37 +430,97 @@ def contador():
 
 # ---------------- Gráfico de evolução ----------------
 def grafico_evolucao(hist, top=5, linha_50=False):
-    ultimos = sorted(hist[-1]["cands"].items(), key=lambda kv: -kv[1])[:top]
-    nomes = [n for n, _ in ultimos]
-    rows = [
-        {"Seções totalizadas (%)": h["pst"], "Hora": h["hora"], "Candidato": n, "% dos votos": p}
-        for h in hist for n, p in h["cands"].items() if n in nomes
-    ]
-    dados = pd.DataFrame(rows)
+    try:
+        if not hist:
+            st.warning("Histórico vazio — nenhum ponto registrado ainda.")
+            return
 
-    chart = alt.Chart(dados).mark_line(point=True, strokeWidth=3).encode(
-        x=alt.X("Seções totalizadas (%):Q", scale=alt.Scale(domain=[0, 100])),
-        y=alt.Y("% dos votos:Q"),
-        color=alt.Color("Candidato:N", sort=nomes,
-                        legend=alt.Legend(orient="bottom", labelLimit=140, columns=2)),
-        tooltip=["Candidato", alt.Tooltip("% dos votos:Q", format=".2f"),
-                 alt.Tooltip("Seções totalizadas (%):Q", format=".2f"), "Hora"],
-    )
-    if linha_50:
-        regra = alt.Chart(pd.DataFrame({"y": [50]})).mark_rule(
-            strokeDash=[6, 4], color="gray").encode(y="y:Q")
-        chart = chart + regra
+        ultimos = sorted(hist[-1]["cands"].items(), key=lambda kv: -kv[1])[:top]
+        nomes = [n for n, _ in ultimos]
+        rows = [
+            {"Seções totalizadas (%)": float(h["pst"]), "Hora": h["hora"],
+             "Candidato": n, "% dos votos": float(p)}
+            for h in hist for n, p in h["cands"].items() if n in nomes
+        ]
+        dados = pd.DataFrame(rows)
+        if dados.empty:
+            st.warning("Histórico sem dados de candidatos.")
+            return
 
-    st.altair_chart(chart.properties(height=320), use_container_width=True)
-    if len(hist) == 1:
-        st.caption("O gráfico ganha forma conforme novas totalizações são publicadas.")
+        chart = alt.Chart(dados).mark_line(point=True, strokeWidth=3).encode(
+            x=alt.X("Seções totalizadas (%):Q", scale=alt.Scale(domain=[0, 100])),
+            y=alt.Y("% dos votos:Q"),
+            color=alt.Color("Candidato:N", sort=nomes,
+                            legend=alt.Legend(orient="bottom", labelLimit=140, columns=2)),
+            tooltip=["Candidato", alt.Tooltip("% dos votos:Q", format=".2f"),
+                     alt.Tooltip("Seções totalizadas (%):Q", format=".2f"), "Hora"],
+        )
+        if linha_50:
+            regra = alt.Chart(pd.DataFrame({"y": [50]})).mark_rule(
+                strokeDash=[6, 4], color="gray").encode(y="y:Q")
+            chart = chart + regra
+
+        st.altair_chart(chart.properties(height=320), use_container_width=True)
+        if len(hist) == 1:
+            st.caption("O gráfico ganha forma conforme novas totalizações são publicadas.")
+
+    except Exception as ex:
+        st.error(f"Erro ao desenhar o gráfico: {type(ex).__name__}: {ex}")
+
+    with st.expander("🔧 Diagnóstico do gráfico"):
+        st.write(f"Pontos no histórico: {len(hist)}")
+        if hist:
+            st.json(hist[-1])
+
+
+# ---------------- Painel de diferenças ----------------
+def painel_diferencas(df, votos_validos, ctx, top=5, mostrar_50=False):
+    st.markdown("#### ⚖️ Diferença de votos entre os candidatos")
+    d = df.head(top).reset_index(drop=True)
+    if len(d) < 2:
+        st.caption("Há só um candidato neste resultado.")
+        return
+
+    lider, segundo = d.iloc[0], d.iloc[1]
+    dif_votos = int(lider["Votos"] - segundo["Votos"])
+    dif_pp = float(lider["%"] - segundo["%"])
+
+    with st.container(key=f"dif_{ctx}"):
+        cols = st.columns(2 if mostrar_50 and votos_validos else 1)
+        cols[0].metric(
+            f"{lider['Candidato']} à frente de {segundo['Candidato']}",
+            f"{fmt_int(dif_votos)} votos",
+            f"{dif_pp:.2f} p.p.", delta_color="off",
+        )
+        if mostrar_50 and votos_validos:
+            margem = int(lider["Votos"] - votos_validos / 2)
+            if margem > 0:
+                cols[1].metric(f"{lider['Candidato']} acima de 50% dos válidos",
+                               f"+{fmt_int(margem)} votos", "vence no 1º turno se mantiver",
+                               delta_color="normal")
+            else:
+                cols[1].metric(f"Faltam para {lider['Candidato']} chegar a 50%",
+                               f"{fmt_int(-margem)} votos", "abaixo da maioria → 2º turno",
+                               delta_color="inverse")
+
+    atras_lider = lider["Votos"] - d["Votos"]
+    atras_anterior = d["Votos"].shift(1) - d["Votos"]
+    tabela = pd.DataFrame({
+        "Pos.": [f"{i}º" for i in range(1, len(d) + 1)],
+        "Candidato": d["Candidato"] + " (" + d["Partido"] + ")",
+        "Votos": d["Votos"].map(fmt_int),
+        "%": d["%"].map(lambda x: f"{x:.2f}%"),
+        "Atrás do líder": ["—"] + [fmt_int(x) for x in atras_lider[1:]],
+        "Atrás do anterior": ["—"] + [fmt_int(x) for x in atras_anterior[1:]],
+    })
+    st.dataframe(tabela, hide_index=True, use_container_width=True)
 
 
 # ---------------- Sidebar ----------------
 admin = bool(segredo("ADMIN_KEY")) and st.query_params.get("admin") == segredo("ADMIN_KEY")
 
 st.sidebar.title("🗳️ Apuração TSE")
-st.sidebar.caption("por **Roberto Sousa**")
+st.sidebar.caption(f"por **{AUTOR}** · {EMAIL}")
 with st.sidebar:
     contador()
 
@@ -580,6 +644,10 @@ def painel(url, titulo, local, foto_base, intervalo, demo, linha_50=False, ctx="
     st.markdown("#### 📈 Evolução da apuração")
     grafico_evolucao(hist, linha_50=linha_50)
 
+    # Diferença de votos entre os candidatos
+    vv = df["Votos"].sum() if demo else num(v.get("vv"))
+    painel_diferencas(df, vv, ctx, mostrar_50=linha_50)
+
     # Totais
     with st.container(key=f"totais_{ctx}"):
         c1, c2, c3, c4, c5 = st.columns(5)
@@ -633,4 +701,4 @@ with aba_exp:
     painel(url_exp, cargos.get(cd_cargo, ""), local_exp, foto_exp, intervalo, demo, ctx="exp")
 
 st.divider()
-st.caption("Desenvolvido por **Roberto Sousa** · @ominivac Dados: TSE")
+st.caption(f"Desenvolvido por **{AUTOR}** · {EMAIL} · Dados: TSE")
