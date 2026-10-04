@@ -1,20 +1,19 @@
 import html
 import threading
-import uuid
 import time
+import uuid
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import altair as alt
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("America/Sao_Paulo")
-
 FONTES = {
-     "Oficial (dia da eleição)": ("https://resultados.tse.jus.br", "oficial"),
+    "Oficial (dia da eleição)": ("https://resultados.tse.jus.br", "oficial"),
     "Simulado TSE 2026": ("https://resultados-sim.tse.jus.br/simulado", "simulado2026"),
 }
 UFS = ["ac","al","am","ap","ba","ce","df","es","go","ma","mg","ms","mt","pa","pb",
@@ -132,21 +131,6 @@ def registrar(chave, marca, pst, df, s=None):
             h.append(snap)
             del h[:-MAX_PONTOS]
         return list(h)
-    """Guarda um ponto (pst, % por candidato) só quando a totalização muda."""
-    top = df.head(TOP_HIST)
-    snap = {
-        "marca": marca,
-        "pst": pst,
-        "hora": datetime.now().strftime("%H:%M:%S"),
-        "cands": {f'{r["Candidato"]} ({r["Partido"]})': r["%"] for _, r in top.iterrows()},
-    }
-    s = store()
-    with s["lock"]:
-        h = s["hist"].setdefault(chave, [])
-        if not h or h[-1]["marca"] != marca:
-            h.append(snap)
-            del h[:-MAX_PONTOS]
-        return list(h)
 
 
 def simular(df, url, intervalo):
@@ -168,54 +152,6 @@ def simular(df, url, intervalo):
     out = out.sort_values("Votos", ascending=False).reset_index(drop=True)
     return out, p, f"demo-{min(passo, 20)}"
 
-# ---------------- Contador de visitantes ----------------
-@st.cache_resource
-def visitas():
-    return {"lock": threading.Lock(), "total": 0, "online": {}}
-
-def incrementar_supabase():
-    """Soma +1 no banco e devolve o total. Retorna None se falhar."""
-    try:
-        r = http().post(
-            f'{st.secrets["SUPABASE_URL"]}/rest/v1/rpc/incrementar_visitas',
-            headers={"apikey": st.secrets["SUPABASE_KEY"],
-                     "Authorization": f'Bearer {st.secrets["SUPABASE_KEY"]}'},
-            json={}, timeout=5,
-        )
-        r.raise_for_status()
-        return int(r.json())
-    except Exception:
-        return None
-
-
-def registrar_visita():
-    v = visitas()
-    if "sid" not in st.session_state:
-        st.session_state.sid = uuid.uuid4().hex
-        total_banco = incrementar_supabase()
-        with v["lock"]:
-            # usa o total do banco; se o Supabase falhar, segue contando em memória
-            v["total"] = total_banco if total_banco is not None else v["total"] + 1
-    with v["lock"]:
-        v["online"][st.session_state.sid] = time.time()
-
-def contar_visitas(janela=60):
-    v = visitas()
-    corte = time.time() - janela
-    with v["lock"]:
-        for sid, t in list(v["online"].items()):
-            if t < corte:                      # sem sinal há 60s = saiu
-                del v["online"][sid]
-        return len(v["online"]), v["total"]
-
-
-@st.fragment(run_every="20s")
-def contador():
-    registrar_visita()
-    online, total = contar_visitas()
-    c1, c2 = st.columns(2)
-    c1.metric("👀 Online", online)
-    c2.metric("📊 Visitas", fmt_int(total))
 
 # ---------------- Helpers ----------------
 def num(x) -> float:
@@ -301,6 +237,7 @@ def candidatos(res) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     return df.sort_values("Votos", ascending=False).reset_index(drop=True) if not df.empty else df
 
+
 # ---------------- Coletor em segundo plano ----------------
 @st.cache_resource
 def coletor(url, intervalo=20):
@@ -330,6 +267,68 @@ def coletor(url, intervalo=20):
     return estado
 
 
+# ---------------- Contador de visitantes ----------------
+@st.cache_resource
+def visitas():
+    return {"lock": threading.Lock(), "total": 0, "online": {}}
+
+
+def incrementar_supabase():
+    """Soma +1 no banco e devolve o total. Em caso de falha, guarda o motivo."""
+    try:
+        r = http().post(
+            f'{st.secrets["SUPABASE_URL"]}/rest/v1/rpc/incrementar_visitas',
+            headers={"apikey": st.secrets["SUPABASE_KEY"],
+                     "Authorization": f'Bearer {st.secrets["SUPABASE_KEY"]}'},
+            json={}, timeout=5,
+        )
+        r.raise_for_status()
+        total = r.json()
+        if total is None:
+            raise ValueError("função retornou vazio (linha id=1 não existe?)")
+        st.session_state.pop("erro_supabase", None)
+        return int(total)
+    except KeyError as ex:
+        st.session_state.erro_supabase = f"secret ausente: {ex}"
+    except requests.HTTPError as ex:
+        st.session_state.erro_supabase = f"HTTP {ex.response.status_code}: {ex.response.text[:150]}"
+    except Exception as ex:
+        st.session_state.erro_supabase = str(ex)
+    return None
+
+
+def registrar_visita():
+    v = visitas()
+    if "sid" not in st.session_state:
+        st.session_state.sid = uuid.uuid4().hex
+        total_banco = incrementar_supabase()
+        with v["lock"]:
+            v["total"] = total_banco if total_banco is not None else v["total"] + 1
+    with v["lock"]:
+        v["online"][st.session_state.sid] = time.time()
+
+
+def contar_visitas(janela=60):
+    v = visitas()
+    corte = time.time() - janela
+    with v["lock"]:
+        for sid, t in list(v["online"].items()):
+            if t < corte:
+                del v["online"][sid]
+        return len(v["online"]), v["total"]
+
+
+@st.fragment(run_every="20s")
+def contador():
+    registrar_visita()
+    online, total = contar_visitas()
+    c1, c2 = st.columns(2)
+    c1.metric("👀 Online", online)
+    c2.metric("📊 Visitas", fmt_int(total))
+    if "erro_supabase" in st.session_state:
+        st.caption(f"⚠️ Contador só em memória — {st.session_state.erro_supabase}")
+
+
 # ---------------- Gráfico de evolução ----------------
 def grafico_evolucao(hist, top=5, linha_50=False):
     ultimos = sorted(hist[-1]["cands"].items(), key=lambda kv: -kv[1])[:top]
@@ -355,9 +354,7 @@ def grafico_evolucao(hist, top=5, linha_50=False):
 
     st.altair_chart(chart.properties(height=320), use_container_width=True)
     if len(hist) == 1:
-            st.caption(f"Totalização: {res.get('dt')} {res.get('ht')} · {status} · "
-               f"atualizado às {datetime.now(TZ):%H:%M:%S} · "
-               f"{len(hist)} pontos no gráfico (último às {hist[-1]['hora']})")
+        st.caption("O gráfico ganha forma conforme novas totalizações são publicadas.")
 
 
 # ---------------- Sidebar ----------------
@@ -465,7 +462,8 @@ def painel(url, titulo, local, foto_base, intervalo, demo, linha_50=False, ctx="
     status = "🧪 simulação" if demo else (
         "✅ totalização final" if res.get("tf") == "s" and pst >= 100 else "⏳ em andamento")
     st.caption(f"Totalização: {res.get('dt')} {res.get('ht')} · {status} · "
-               f"atualizado às {datetime.now():%H:%M:%S}")
+               f"atualizado às {datetime.now(TZ):%H:%M:%S} · "
+               f"{len(hist)} pontos no gráfico (último às {hist[-1]['hora']})")
     st.progress(min(pst / 100, 1.0), text=f"Seções totalizadas: {pst:.2f}%")
 
     # Top 3 com foto
