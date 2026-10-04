@@ -9,6 +9,9 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+from zoneinfo import ZoneInfo
+
+TZ = ZoneInfo("America/Sao_Paulo")
 
 FONTES = {
      "Oficial (dia da eleição)": ("https://resultados.tse.jus.br", "oficial"),
@@ -113,7 +116,22 @@ def store():
     return {"lock": threading.Lock(), "hist": {}, "demo_inicio": {}}
 
 
-def registrar(chave, marca, pst, df):
+def registrar(chave, marca, pst, df, s=None):
+    """Guarda um ponto (pst, % por candidato) só quando a totalização muda."""
+    top = df.head(TOP_HIST)
+    snap = {
+        "marca": marca,
+        "pst": pst,
+        "hora": datetime.now(TZ).strftime("%H:%M:%S"),
+        "cands": {f'{r["Candidato"]} ({r["Partido"]})': r["%"] for _, r in top.iterrows()},
+    }
+    s = s or store()
+    with s["lock"]:
+        h = s["hist"].setdefault(chave, [])
+        if not h or h[-1]["marca"] != marca:
+            h.append(snap)
+            del h[:-MAX_PONTOS]
+        return list(h)
     """Guarda um ponto (pst, % por candidato) só quando a totalização muda."""
     top = df.head(TOP_HIST)
     snap = {
@@ -283,6 +301,34 @@ def candidatos(res) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     return df.sort_values("Votos", ascending=False).reset_index(drop=True) if not df.empty else df
 
+# ---------------- Coletor em segundo plano ----------------
+@st.cache_resource
+def coletor(url, intervalo=20):
+    """Thread única no servidor que grava o histórico mesmo sem ninguém no app."""
+    s, sess, lim = store(), http(), limiter()
+    estado = {"ultimo_ok": None, "erro": None}
+
+    def loop():
+        while True:
+            try:
+                lim.esperar()
+                r = sess.get(url, timeout=15)
+                r.raise_for_status()
+                res = r.json()
+                df = candidatos(res)
+                if not df.empty:
+                    sx = res.get("s", {})
+                    pst = num(sx.get("pstn") or sx.get("pst"))
+                    registrar(url, f"{res.get('dt')} {res.get('ht')}", pst, df, s)
+                    estado["ultimo_ok"] = datetime.now(TZ).strftime("%H:%M:%S")
+                    estado["erro"] = None
+            except Exception as ex:
+                estado["erro"] = str(ex)[:120]
+            time.sleep(intervalo)
+
+    threading.Thread(target=loop, daemon=True).start()
+    return estado
+
 
 # ---------------- Gráfico de evolução ----------------
 def grafico_evolucao(hist, top=5, linha_50=False):
@@ -309,7 +355,9 @@ def grafico_evolucao(hist, top=5, linha_50=False):
 
     st.altair_chart(chart.properties(height=320), use_container_width=True)
     if len(hist) == 1:
-        st.caption("O gráfico ganha forma conforme novas totalizações são publicadas.")
+            st.caption(f"Totalização: {res.get('dt')} {res.get('ht')} · {status} · "
+               f"atualizado às {datetime.now(TZ):%H:%M:%S} · "
+               f"{len(hist)} pontos no gráfico (último às {hist[-1]['hora']})")
 
 
 # ---------------- Sidebar ----------------
@@ -462,8 +510,16 @@ aba_pres, aba_exp = st.tabs(["🇧🇷 Presidente ao vivo", "🔎 Explorar resul
 with aba_pres:
     pres = eleicao_presidente(eleicoes)
     if pres:
+        url_pres = url_resultado(cfg, BASE, ambiente, pres, "1")
+
+        # coletor em segundo plano: grava o histórico mesmo sem ninguém no app
+        if not demo:
+            estado = coletor(url_pres)
+            if estado["erro"]:
+                st.caption(f"⚠️ Coletor: {estado['erro']}")
+
         painel(
-            url_resultado(cfg, BASE, ambiente, pres, "1"),
+            url_pres,
             f"Presidente · {pres['t']}º turno", "Brasil",
             montar_dir(cfg, "ft", BASE, ambiente, pres["ciclo"], pres["cd"], "br"),
             intervalo, demo, linha_50=True, ctx="pres",
@@ -478,4 +534,4 @@ with aba_exp:
     painel(url_exp, cargos.get(cd_cargo, ""), local_exp, foto_exp, intervalo, demo, ctx="exp")
 
 st.divider()
-st.caption("Desenvolvido por **Roberto Sousa**  - ominivac001@proton.me · Dados: TSE")
+st.caption("Desenvolvido por **Roberto Sousa** · @ominivac Dados: TSE")
