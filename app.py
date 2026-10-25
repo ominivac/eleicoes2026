@@ -12,7 +12,7 @@ import requests
 import streamlit as st
 
 AUTOR = "Roberto Sousa"
-EMAIL = "robertokbs@gmail.com"   # <-- coloque seu e-mail aqui
+EMAIL = "seu-email@exemplo.com"   # <-- coloque seu e-mail aqui
 
 TZ = ZoneInfo("America/Sao_Paulo")
 FONTES = {
@@ -71,8 +71,10 @@ def ler_sb():
 
 
 def sb_headers(sb):
-    return {"apikey": sb["key"], "Authorization": f'Bearer {sb["key"]}',
-            "Content-Type": "application/json"}
+    h = {"apikey": sb["key"], "Content-Type": "application/json"}
+    if not sb["key"].startswith("sb_"):      # chave antiga (anon, eyJ...)
+        h["Authorization"] = f'Bearer {sb["key"]}'
+    return h
 
 
 # ---------------- HTTP (rate limit + retry) ----------------
@@ -496,11 +498,11 @@ def painel_diferencas(df, votos_validos, ctx, top=5, mostrar_50=False):
             margem = int(lider["Votos"] - votos_validos / 2)
             if margem > 0:
                 cols[1].metric(f"{lider['Candidato']} acima de 50% dos válidos",
-                               f"+{fmt_int(margem)} votos", "vence no 1º turno se mantiver",
+                               f"+{fmt_int(margem)} votos", "vence se mantiver",
                                delta_color="normal")
             else:
                 cols[1].metric(f"Faltam para {lider['Candidato']} chegar a 50%",
-                               f"{fmt_int(-margem)} votos", "abaixo da maioria → 2º turno",
+                               f"{fmt_int(-margem)} votos", "abaixo da maioria",
                                delta_color="inverse")
 
     atras_lider = lider["Votos"] - d["Votos"]
@@ -551,7 +553,8 @@ demo = st.sidebar.toggle("Modo demonstração", help="Simula a apuração avanç
 
 if admin:
     st.sidebar.success("Modo administrador")
-    if st.sidebar.button("🗑️ Limpar histórico (memória e banco)"):
+    confirmar = st.sidebar.checkbox("Confirmo que quero apagar todo o histórico")
+    if st.sidebar.button("🗑️ Limpar histórico (memória e banco)", disabled=not confirmar):
         limpar_historico()
         st.sidebar.info("Histórico apagado.")
     erro_sb = store()["erro_sb"]
