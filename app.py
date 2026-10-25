@@ -12,7 +12,7 @@ import requests
 import streamlit as st
 
 AUTOR = "Roberto Sousa"
-EMAIL = "seu-email@exemplo.com"   # <-- coloque seu e-mail aqui
+EMAIL = "robertokbs@gmail.com"   # <-- coloque seu e-mail aqui
 
 TZ = ZoneInfo("America/Sao_Paulo")
 FONTES = {
